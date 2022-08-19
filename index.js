@@ -237,7 +237,7 @@ async function translateBlocks(id, nestedDepth) {
         }
       }
 
-      if (block.type === "mention") {
+      if (block.type === "mention" || block.type === "table") {
         continue;
       }
 
