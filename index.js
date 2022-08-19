@@ -34,12 +34,22 @@ const deepl = require("deepl-node");
 const translator = new deepl.Translator(process.env.DEEPL_API_TOKEN);
 
 async function translateText(richTextArray, from, to) {
-  for (const each of richTextArray) {
-    if (each.plain_text) {
-      const result = await translator.translateText(each.plain_text, from, to);
-      each.plain_text = result.text;
-      if (each.text) {
-        each.text.content = each.plain_text;
+  for (const item of richTextArray) {
+    if (item.plain_text) {
+      const result = await translator.translateText(item.plain_text, from, to);
+
+      if (item.annotations.bold) {
+        item.plain_text = ` ${result.text} `;
+      } else {
+        item.plain_text = result.text;
+      }
+
+      if (item.text) {
+        if (item.annotations.bold) {
+          item.text.content = ` ${result.text} `;
+        } else {
+          item.text.content = result.text;
+        }
       }
     }
   }
@@ -129,6 +139,8 @@ function toPrettifiedJSON(obj) {
 // Removes unnecessary block properties for new creation
 function removeUnecessaryProperties(obj) {
   delete obj.id;
+  delete obj.type;
+  delete obj.cover;
   delete obj.created_time;
   delete obj.last_edited_time;
   delete obj.created_by;
@@ -186,10 +198,11 @@ if (debug) {
 // ------------------------
 // Main code
 
-async function buildTranslatedBlocks(id, nestedDepth) {
+async function translateBlocks(id, nestedDepth) {
   const translatedBlocks = [];
   let cursor;
   let hasMore = true;
+
   while (hasMore) {
     const blocks = await notion.blocks.children.list({
       block_id: id,
@@ -201,106 +214,89 @@ async function buildTranslatedBlocks(id, nestedDepth) {
         `Fetched original blocks: ${JSON.stringify(blocks.results, null, 2)}`
       );
     }
+
     // Print dot for the user that is waiting for the completion
     process.stdout.write(".");
 
     for (const result of blocks.results) {
-      var b = result;
+      let block = {
+        ...result,
+        block_id: result.id,
+      };
+
       if (nestedDepth >= 2) {
-        b.has_children = false;
+        block.has_children = false;
       }
+
       if (nestedDepth == 1) {
-        if (b.type === "column_list") {
+        if (block.type === "column_list") {
           // If this column_list block is already in the one-level nested children,
           // its children (= column blocks) are unable to have children
-          b.column_list.children = [];
+          block.column_list.children = [];
           continue;
         }
       }
-      if (b.type === "file") {
-        if (b.file.type === "external") {
-          if (!b.file.url || b.file.url.trim().length === 0) {
-            // The API endpoint for 3rd parties rejects the empty external file URL pattern even though it can exist
-            continue;
-          }
-        } else {
-          // The file blocks do not work in a copied page
-          const notice = [
-            {
-              plain_text: "(The file was removed from this page)",
-              text: { content: "" },
-            },
-          ];
-          await translateText(notice, "en", to);
-          b = {
-            type: "paragraph",
-            paragraph: {
-              color: "default",
-              rich_text: notice,
-            },
-          };
-        }
+
+      if (block.type === "mention") {
+        continue;
       }
-      if (b.type === "child_page") {
-        // Convert a child_page in the original page to link_to_page
-        try {
-          b.type = "link_to_page";
-          const page = await notion.pages.retrieve({ page_id: b.id });
-          b.link_to_page = {
-            type: "page_id",
-            page_id: page.id,
-          };
-          delete b.child_page;
-          b.has_children = false;
-        } catch (e) {
-          if (debug) {
-            console.log(
-              `Failed to load a page (error: ${e}) - Skipped this block.`
-            );
-          }
-          continue;
+
+      if (
+        block.type === "unsupported" ||
+        block.type === "child_page" ||
+        block.type === "child_database"
+      ) {
+        if (debug) {
+          console.log(
+            `Fetched block is not a text we don't need to translate it: ${toPrettifiedJSON(
+              block
+            )}`
+          );
         }
-      } else if (b.type === "child_database") {
-        // Convert a child_database in the original page to link_to_page
-        try {
-          b.type = "link_to_page";
-          const d = await notion.databases.retrieve({ database_id: b.id });
-          b.link_to_page = {
-            type: "database_id",
-            database_id: d.id,
-          };
-          delete b.child_database;
-          b.has_children = false;
-        } catch (e) {
-          if (debug) {
-            console.log(
-              `Failed to load a database (error: ${e}) - Skipped this block.`
-            );
-          }
-          continue;
-        }
-      } else if (b.has_children) {
+
+        continue;
+      }
+
+      if (block.type === "image") {
+        delete block.image.type;
+        delete block.image.file;
+        delete block.image.external;
+      }
+
+      if (block.has_children) {
         if (nestedDepth >= 3) {
           // https://developers.notion.com/reference/patch-block-children
           // > For blocks that allow children, we allow up to two levels of nesting in a single request.
           continue;
         }
         // Recursively call this method for nested children blocks
-        b[b.type].children = await buildTranslatedBlocks(b.id, nestedDepth + 1);
+        block[block.type].children = await translateBlocks(
+          block.id,
+          nestedDepth + 1
+        );
       }
-      removeUnecessaryProperties(b);
+
+      removeUnecessaryProperties(block);
+
       // Translate all the text parts in this nest level
-      for (const [k, v] of Object.entries(b)) {
+      for (const [k, v] of Object.entries(block)) {
         if (v instanceof Object) {
           for (const [_k, _v] of Object.entries(v)) {
-            if (_k === "caption" || (_k === "rich_text" && b.type !== "code")) {
+            if (
+              _k === "caption" ||
+              (_k === "rich_text" && block.type !== "code")
+            ) {
               await translateText(_v, from, to);
             }
           }
         }
       }
-      // Add this valid block to the result
-      translatedBlocks.push(b);
+
+      if (debug) {
+        console.log(`Update block request params: ${toPrettifiedJSON(block)}`);
+      }
+
+      await notion.blocks.update(block);
     }
 
     // For pagination
@@ -310,41 +306,38 @@ async function buildTranslatedBlocks(id, nestedDepth) {
       hasMore = false;
     }
   }
-  return translatedBlocks;
 }
 
-async function createNewPageForTranslation(originalPage) {
+async function updateTranslatedPage(originalPage) {
   const newPage = JSON.parse(JSON.stringify(originalPage)); // Create a deep copy
-  // Create the translated page as a child of the original page
-  newPage.parent = { page_id: originalPage.id };
-  const originalTitle = originalPage.properties.title.title[0];
-  const newTitle = newPage.properties.title.title[0];
-  newTitle.text.content = originalTitle.text.content + ` (${to})`;
-  newTitle.plain_text = originalTitle.plain_text + ` (${to})`;
+
+  newPage.page_id = originalPage.id;
+
+  await translateText(newPage.properties.title.title, from, to);
+
   removeUnecessaryProperties(newPage);
 
   if (debug) {
-    console.log(
-      `New page creation request params: ${toPrettifiedJSON(newPage)}`
-    );
+    console.log(`\nUpdate page request params: ${toPrettifiedJSON(newPage)}`);
   }
-  const newPageCreation = await notion.pages.create(newPage);
+  const newPageCreation = await notion.pages.update(newPage);
   if (debug) {
-    console.log(
-      `New page creation response: ${toPrettifiedJSON(newPageCreation)}`
-    );
+    console.log(`\nUpdate page response: ${toPrettifiedJSON(newPageCreation)}`);
   }
   return newPageCreation;
 }
 
 (async function () {
   let originalPage;
+
   const contentId = url.split("/").last().split("-").last();
+
   try {
     originalPage = await notion.pages.retrieve({ page_id: contentId });
   } catch (e) {
     try {
       await notion.databases.retrieve({ database_id: contentId });
+
       console.error(
         "\nERROR: This URL is a database. This tool currently supports only pages.\n"
       );
@@ -353,35 +346,22 @@ async function createNewPageForTranslation(originalPage) {
         `\nERROR: Failed to read the page content!\n\nError details: ${e}\n\nPlease make sure the following:\n * The page is shared with your app\n * The API token is the one for this workspace\n`
       );
     }
+
     process.exit(1);
   }
+
   if (debug) {
-    console.log(`The page metadata: ${toPrettifiedJSON(originalPage)}`);
+    console.log(`\nOriginal page content: ${toPrettifiedJSON(originalPage)}\n`);
   }
 
   process.stdout.write(
-    `\nWait a minute! Now translating the following Notion page:\n${url}\n\n(this may take a bit long) ...`
+    `\nWait a minute! Now translating the following Notion page:\n${url}\n\n(this may take some time) ...`
   );
-  const translatedBlocks = await buildTranslatedBlocks(originalPage.id, 0);
-  const newPage = await createNewPageForTranslation(originalPage);
-  const blocksAppendParams = {
-    block_id: newPage.id,
-    children: translatedBlocks,
-  };
-  if (debug) {
-    console.log(
-      `Block creation request params: ${toPrettifiedJSON(blocksAppendParams)}`
-    );
-  }
-  const blocksAddition = await notion.blocks.children.append(
-    blocksAppendParams
-  );
-  if (debug) {
-    console.log(`Block creation response: ${toPrettifiedJSON(blocksAddition)}`);
-  }
+
+  await updateTranslatedPage(originalPage);
+  await translateBlocks(originalPage.id, 0);
+
   console.log(
     "... Done!\n\nDisclaimer:\nSome parts might not be perfect.\nIf the generated page is missing something, please adjust the details on your own.\n"
   );
-  console.log(`Here is the translated Notion page:\n${newPage.url}\n`);
-  open(newPage.url);
 })();
